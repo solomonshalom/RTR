@@ -816,6 +816,26 @@ select.mini{appearance:none;padding-right:20px;
   }
   .paper:last-child{break-after:auto;page-break-after:auto}
 }
+
+/* ---- auto-fill dialog ---------------------------------------------------- */
+.tbtn:disabled{opacity:.45;pointer-events:none}
+.modal.ai-modal{width:560px;max-height:calc(100vh - 40px);overflow:auto}
+.modal .fgroup{margin-bottom:16px}
+.ai-strip{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.ai-strip:empty{display:none}
+.ai-strip > span{position:relative;width:52px;height:52px}
+.ai-strip img{width:52px;height:52px;object-fit:cover;border-radius:6px;box-shadow:inset 0 0 0 .5px rgba(0,0,0,.1);display:block}
+.ai-strip button{position:absolute;top:-5px;right:-5px;width:18px;height:18px;border-radius:50%;background:#fff;
+  box-shadow:0 1px 3px rgba(0,0,0,.25);display:grid;place-items:center;color:#C0392B}
+.ai-strip button svg{width:9px;height:9px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round}
+.ai-strip .more{display:grid;place-items:center;border-radius:6px;background:#F1F1EC;font-size:12px;font-weight:700;color:#55555A}
+.ai-pick{display:flex;gap:8px;margin-top:8px}
+.ai-check{display:flex;gap:8px;align-items:center;font-size:12.5px;font-weight:500;color:#3A3A40;margin:0 0 16px;cursor:pointer}
+.ai-prog{margin:0 0 16px}
+.ai-prog .bar{height:6px;border-radius:3px;background:#EDEDE8;overflow:hidden}
+.ai-prog .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#F2AE05,#FFCF3D);transition:width .3s}
+.ai-prog .msg{font-size:12px;color:var(--ui-dim);margin-top:7px;line-height:1.45}
+.ai-prog .msg.err{color:#C0392B}
 </style>
 </head>
 <body>
@@ -844,6 +864,8 @@ select.mini{appearance:none;padding-right:20px;
       <button data-mode="preview">Preview</button>
     </div>
 
+    <button class="tbtn" id="btnAI" title="Add every photograph at once — Qwen places them and writes the report">
+      <svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9zM19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/></svg><span class="lbl">Auto-fill</span></button>
     <button class="tbtn" id="btnOpen" title="Open a saved .rotaract file">
       <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span class="lbl">Open</span></button>
     <button class="tbtn" id="btnSave" title="Download this report as a file">
@@ -873,6 +895,8 @@ select.mini{appearance:none;padding-right:20px;
 <input type="file" id="fileLogo" accept="image/*" hidden>
 <input type="file" id="fileTxt"  accept=".txt,.md,text/plain,text/markdown" hidden>
 <input type="file" id="fileJson" accept=".rotaract,.json,application/json" hidden>
+<input type="file" id="fileBulk" accept="image/*" multiple hidden>
+<input type="file" id="fileBulkDir" webkitdirectory multiple hidden>
 
 <script>
 "use strict";
@@ -1635,6 +1659,459 @@ async function addLogo(replaceId){
   renderAll(); touch();
 }
 
+/* ============================================================================
+   AUTO-FILL  —  drop in every photograph from the event at once. Qwen (served
+   by Groq) looks at each one, seats it where it belongs in the report — cover,
+   sections, wide breaks, gallery, closing — writes its caption, and drafts any
+   text that has been left blank.
+
+   Photographs live inside the report itself (as data URLs, exactly like the
+   ones added by hand), never on a server. A reduced copy of each is sent to
+   Groq only for the moment it is being read, and Groq does not keep it.
+   ==========================================================================*/
+const GROQ = {
+  /* Paste the club's Groq key here to ship it with the app. Left blank, the
+     Auto-fill dialog asks for it once and remembers it in this browser. */
+  key: '',
+  url: 'https://api.groq.com/openai/v1/chat/completions',
+  /* the first model that answers is used; the others are fallbacks for the
+     day Groq retires one. Both read images and write text. */
+  models: ['qwen/qwen3.8-27b', 'qwen/qwen3.6-27b']
+};
+const AI_LAYOUTS = ['right','left','feature','quote'];
+const AI_UPPER   = { kicker:1, caption:1, statementMeta:1 };   /* fields the report prints in caps */
+
+function wait(ms, signal){
+  return new Promise((res,rej)=>{
+    if(signal && signal.aborted) return rej(new Error('cancelled'));
+    const t = setTimeout(res, ms);
+    if(signal) signal.addEventListener('abort', ()=>{ clearTimeout(t); rej(new Error('cancelled')); }, {once:true});
+  });
+}
+/* Groq says how long to hold off, either as a header or inside the message
+   ("Please try again in 12.3s" / "in 1m4.2s") */
+function retryAfter(res, msg){
+  let s = parseFloat(res.headers.get('retry-after'));
+  if(!(s > 0)){
+    const m = /try again in (?:(\d+)m)?([\d.]+)s/i.exec(msg||'');
+    if(m) s = (Number(m[1])||0)*60 + Number(m[2]);
+  }
+  if(!(s > 0)) s = 8;
+  return Math.min(90, s + 0.6);
+}
+/* the model is asked for JSON; strip anything it wraps around it */
+function parseJSON(text){
+  let t = String(text||'').trim().replace(/^```(?:json)?\s*/i,'').replace(/```\s*$/,'');
+  const a = t.indexOf('{'), b = t.lastIndexOf('}');
+  if(a >= 0 && b > a) t = t.slice(a, b+1);
+  try{ return JSON.parse(t); }
+  catch(err){ throw new Error('The model replied with something that was not JSON'); }
+}
+
+function groqKey(){
+  if(GROQ.key) return GROQ.key;
+  try{ return localStorage.getItem('rrb.groqKey') || ''; }catch(err){ return ''; }
+}
+function rememberGroqKey(k){
+  try{ if(k) localStorage.setItem('rrb.groqKey', k); else localStorage.removeItem('rrb.groqKey'); }catch(err){}
+}
+const ai = {
+  modelIdx: 0,
+  get model(){ return GROQ.models[this.modelIdx]; },
+  async chat(messages, opts){
+    opts = opts || {};
+    let attempt = 0, jsonRetry = 0;
+    for(;;){
+      const body = { model: this.model, messages,
+                     temperature: opts.temperature == null ? 0.6 : opts.temperature,
+                     max_tokens: opts.maxTokens || 1200,
+                     response_format: { type:'json_object' } };
+      let res, text;
+      try{
+        res = await fetch(GROQ.url, { method:'POST', signal: opts.signal,
+          headers:{ 'Authorization':'Bearer '+groqKey(), 'Content-Type':'application/json' },
+          body: JSON.stringify(body) });
+        text = await res.text();
+      }catch(err){
+        if(opts.signal && opts.signal.aborted) throw new Error('cancelled');
+        if(attempt++ < 3){ await wait(1500*attempt, opts.signal); continue; }
+        throw new Error('Could not reach Groq — check the internet connection and try again');
+      }
+      let json = null; try{ json = JSON.parse(text); }catch(err){}
+      if(res.ok){
+        const msg = json && json.choices && json.choices[0] && json.choices[0].message;
+        return parseJSON(msg && msg.content);
+      }
+      const e = json && json.error || {};
+      const errMsg = e.message || e.code || text || ('HTTP '+res.status);
+      /* a retired or unavailable model — fall through to the next on the list */
+      if((res.status===404 || /model/i.test(e.code||'')) && this.modelIdx < GROQ.models.length-1){ this.modelIdx++; continue; }
+      if(res.status===429 || res.status>=500){
+        if(attempt++ >= 10) throw new Error('Groq kept refusing the request — '+errMsg);
+        const secs = retryAfter(res, errMsg);
+        if(opts.onWait) opts.onWait(secs);
+        await wait(secs*1000, opts.signal); continue;
+      }
+      if(e.code==='json_validate_failed' && jsonRetry++ < 2) continue;
+      if(res.status===401 || res.status===403){ if(!GROQ.key) rememberGroqKey(''); throw new Error('Groq rejected the API key — check it and try again'); }
+      if(res.status===413) throw new Error('That is too much for one request — try fewer photographs at a time');
+      throw new Error(errMsg);
+    }
+  }
+};
+
+/* a small JPEG copy for the model to look at — the report keeps the full one */
+function analysisCopy(im, max){
+  return new Promise(res=>{
+    const i = new Image();
+    i.onload = ()=>{
+      const sc = Math.min(1, (max||768) / Math.max(i.naturalWidth, i.naturalHeight));
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(i.naturalWidth*sc)); c.height = Math.max(1, Math.round(i.naturalHeight*sc));
+      c.getContext('2d').drawImage(i, 0, 0, c.width, c.height);
+      res(c.toDataURL('image/jpeg', 0.72));
+    };
+    i.onerror = ()=> res(im.data);
+    i.src = im.data;
+  });
+}
+
+function eventContext(notes){
+  const m = S.meta;
+  return 'Event: '+(m.eventName||'')+'. Date: '+(m.eventDate||'')+'. Organised by: '+(m.department||'')+', '+
+    (m.club||'')+', '+(m.district||'')+', '+(m.institution||'')+'.'+
+    (notes && notes.trim() ? '\nNotes from the editor: '+notes.trim() : '');
+}
+
+async function describePhoto(photo, ctx, opts){
+  const prompt =
+    'You are cataloguing photographs from a Rotaract club event so an editor can lay out a printed report.\n'+ctx+'\n\n'+
+    'Look at this photograph and reply with JSON using exactly these keys:\n'+
+    '{"description": "one or two concrete sentences — who is in it, what is happening, the setting",\n'+
+    ' "subjects": ["three to six short tags"],\n'+
+    ' "people": <number of people visible>,\n'+
+    ' "shot": "wide" | "medium" | "close-up",\n'+
+    ' "focus": "top" | "center" | "bottom"  (where the main subject sits in the frame),\n'+
+    ' "quality": <1 to 5 — sharpness, light and composition>,\n'+
+    ' "visible_text": "any banner, sign or slide text, else an empty string",\n'+
+    ' "mood": "one or two words"}\n'+
+    'Do not invent names of people.';
+  const out = await ai.chat([{ role:'user', content:[
+      { type:'text', text: prompt },
+      { type:'image_url', image_url:{ url: photo.small } } ] }],
+    { maxTokens: 400, temperature: 0.2, signal: opts.signal, onWait: opts.onWait });
+  const im = photo.image;
+  return {
+    description: String(out.description||'').trim() || 'A photograph from the event',
+    subjects: Array.isArray(out.subjects) ? out.subjects.map(String).slice(0,6) : [],
+    people: Number(out.people)||0,
+    shot: /wide|medium|close/.test(out.shot||'') ? String(out.shot) : 'medium',
+    focus: /^(top|center|bottom)$/.test(out.focus||'') ? out.focus : 'center',
+    quality: Math.max(1, Math.min(5, Number(out.quality)||3)),
+    visible_text: String(out.visible_text||'').trim().slice(0,120),
+    mood: String(out.mood||'').trim().slice(0,40),
+    orientation: im.w > im.h*1.15 ? 'landscape' : im.h > im.w*1.15 ? 'portrait' : 'square'
+  };
+}
+
+/* what the planner is told about the report as it stands */
+const clip = (s,n)=> { s = String(s||'').replace(/\s+/g,' ').trim(); return s.length > n ? s.slice(0,n)+'…' : s; };
+function reportSnapshot(overwrite){
+  const has = im => !!im && !overwrite;
+  return {
+    cover:    { title: clip(S.cover.title,120), deck: clip(S.cover.deck,300), caption: clip(S.cover.caption,120), hasImage: has(S.cover.image) },
+    overview: clip(S.overview.text, 400),
+    sections: S.sections.map(s=> s.layout==='quote'
+      ? { id:s.id, layout:'quote', quote: clip(s.quote,200), quoteWho: clip(s.quoteWho,80) }
+      : { id:s.id, layout:s.layout, kicker: clip(s.kicker,60), headline: clip(s.headline,120),
+          body: clip(s.body, 260), caption: clip(s.caption,120), hasImage: has(s.image) }),
+    gallery:  { intro: clip(S.gallery.intro,200), photosAlready: S.gallery.items.length },
+    closing:  { headline: clip(S.closing.headline,120), body: clip(S.closing.body,300),
+                statement: clip(S.closing.statement,160), statementMeta: clip(S.closing.statementMeta,100),
+                hasImage: has(S.closing.image) }
+  };
+}
+
+async function planReport(descs, ctx, overwrite, opts){
+  const system =
+    'You are the editor of a printed Rotaract club event report — a warm, well-written magazine-style document. '+
+    'You are given the event, the report as it stands, and a numbered catalogue of photographs. '+
+    'Decide where every photograph goes and write the words around them. Reply with JSON only.\n\n'+
+    'HOUSE STYLE\n'+
+    '- British spelling (honour, programme, organised). Warm, specific, first person plural ("we"). No clichés, no exclamation marks, no emoji.\n'+
+    '- kicker: two or three words in capitals naming the moment, e.g. "THE WELCOME", "THE CARDS", "THE TAKEAWAY".\n'+
+    '- headline: a short sentence fragment of six to ten words, broken into two lines with \\n, e.g. "A welcome fit for\\nguests of honour".\n'+
+    '- body: two or three paragraphs of 60–110 words each, separated by a blank line (\\n\\n). Write only what the notes and photographs support; never invent names, numbers or quotations.\n'+
+    '- caption: a short editorial phrase in capitals, e.g. "A QUIET MOMENT BEFORE THE PROGRAMME".\n'+
+    '- cover title: three to six words on two lines (\\n), with the key word wrapped in *asterisks* so it prints in the accent colour, e.g. "Of Petals\\n*&* People".\n'+
+    '- cover deck: one or two sentences in plain language saying what the report is about.\n'+
+    '- overview: one paragraph of 60–100 words that opens the report.\n'+
+    '- closing headline, body, statement (one or two short lines, \\n between them) and statementMeta (capitals: EVENT · DATE · PLACE).\n\n'+
+    'PLACING PHOTOGRAPHS\n'+
+    '- Every photograph index must appear exactly once across cover, sections, gallery and closing.\n'+
+    '- cover: the single best wide, well-lit, landscape photograph that sums up the event.\n'+
+    '- Each existing section whose layout is "right" or "left" and hasImage is false gets the one photograph that best matches its subject. Sections with hasImage true must not be given a photograph.\n'+
+    '- A strong landscape photograph that deserves the full page width may become a new section with layout "feature" (a caption, no body). Use at most two.\n'+
+    '- closing: one atmospheric photograph that sits behind a dark veil — a wide or quiet shot, not a face close-up.\n'+
+    '- gallery: everything else, each with its own caption. Order them as the day unfolded.\n'+
+    '- If the notes describe a distinct moment that no section covers yet and a photograph shows it, you may add a new section (id null, layout "right" or "left", alternating). Keep the total number of sections at or below eight.\n'+
+    '- Never add "quote" sections unless the notes contain an actual quotation.\n\n'+
+    'WRITING\n'+
+    (overwrite
+      ? '- Rewrite every text field to its best version in the house style; existing text is only a hint.\n'
+      : '- Keep every existing non-empty text exactly as it is — return it unchanged or omit it. Write text only for fields that are empty.\n')+
+    '- Return every existing section (by id, in a sensible order, keeping their layout) plus any new ones.\n\n'+
+    'OUTPUT SHAPE\n'+
+    '{"cover": {"photo": <index or null>, "caption": "", "title": "", "deck": ""},\n'+
+    ' "overview": "",\n'+
+    ' "sections": [{"id": "<existing id or null>", "layout": "right|left|feature|quote", "photo": <index or null>, "kicker": "", "headline": "", "body": "", "caption": "", "quote": "", "quoteWho": ""}],\n'+
+    ' "gallery": {"intro": "", "photos": [{"photo": <index>, "caption": ""}]},\n'+
+    ' "closing": {"photo": <index or null>, "headline": "", "body": "", "statement": "", "statementMeta": ""}}';
+  const user =
+    ctx+'\n\nTHE REPORT AS IT STANDS\n'+JSON.stringify(reportSnapshot(overwrite))+
+    '\n\nPHOTOGRAPHS\n'+JSON.stringify(descs.map((d,i)=> ({ photo:i, description:d.description, subjects:d.subjects,
+      people:d.people, shot:d.shot, orientation:d.orientation, quality:d.quality, text:d.visible_text, mood:d.mood })))+
+    '\n\nReply with the JSON plan.';
+  return ai.chat([{ role:'system', content: system }, { role:'user', content: user }],
+    { maxTokens: 4500, temperature: 0.7, signal: opts.signal, onWait: opts.onWait });
+}
+
+function applyPlan(plan, photos, descs, overwrite){
+  const done = { cover:0, sections:0, features:0, gallery:0, closing:0, newSections:0, fields:0 };
+  const used = new Set();
+  const take = n => {
+    n = Number(n);
+    if(!Number.isInteger(n) || n < 0 || n >= photos.length || used.has(n)) return null;
+    used.add(n);
+    const im = Object.assign({}, photos[n].image, { pos: descs[n] ? descs[n].focus : 'center' });
+    return im;
+  };
+  const put = (obj, key, val)=>{
+    if(typeof val !== 'string') return false;
+    val = val.replace(/\r\n/g,'\n').trim();
+    if(!val) return false;
+    if(AI_UPPER[key]) val = val.toUpperCase();
+    if(String(obj[key]||'').trim() && !overwrite) return false;
+    if(obj[key] === val) return false;
+    obj[key] = val; done.fields++; return true;
+  };
+  const ok = o => o && typeof o === 'object';
+  const p = ok(plan) ? plan : {};
+
+  /* cover */
+  if(ok(p.cover)){
+    if(!S.cover.image || overwrite){ const im = take(p.cover.photo); if(im){ S.cover.image = im; done.cover++; if(overwrite || !S.cover.caption.trim()) S.cover.caption = ''; put(S.cover,'caption',p.cover.caption); } }
+    put(S.cover,'title',p.cover.title); put(S.cover,'deck',p.cover.deck);
+  }
+  put(S.overview,'text', typeof p.overview === 'string' ? p.overview : (ok(p.overview) ? p.overview.text : ''));
+
+  /* sections — the planner returns the whole ordered list, old and new */
+  const byId = {}; S.sections.forEach(s=> byId[s.id] = s);
+  const out = [], seen = new Set();
+  (Array.isArray(p.sections) ? p.sections : []).forEach(it=>{
+    if(!ok(it)) return;
+    let sec = it.id && byId[it.id];
+    if(sec){ if(seen.has(sec.id)) return; seen.add(sec.id); }
+    else {
+      if(out.filter(s=>!byId[s.id]).length + S.sections.length >= 12) return;
+      const lay = AI_LAYOUTS.indexOf(it.layout) >= 0 ? it.layout : 'right';
+      if(lay === 'quote' && !String(it.quote||'').trim()) return;
+      sec = blankSection('', lay); done.newSections++;
+    }
+    if(sec.layout === 'quote'){
+      put(sec,'quote',it.quote); put(sec,'quoteWho',it.quoteWho);
+    } else {
+      if(!sec.image || overwrite){
+        const im = take(it.photo);
+        if(im){ sec.image = im; if(overwrite) sec.caption = ''; if(sec.layout==='feature') done.features++; else done.sections++; }
+      }
+      put(sec,'caption',it.caption);
+      if(sec.layout !== 'feature'){ put(sec,'kicker',it.kicker); put(sec,'headline',it.headline); put(sec,'body',it.body); }
+    }
+    out.push(sec);
+  });
+  /* anything the planner forgot keeps its place */
+  S.sections.forEach((s,i)=>{ if(!seen.has(s.id)) out.splice(Math.min(i, out.length), 0, s); });
+  S.sections = out.length ? out : S.sections;
+
+  /* closing */
+  if(ok(p.closing)){
+    if(!S.closing.image || overwrite){ const im = take(p.closing.photo); if(im){ S.closing.image = im; done.closing++; } }
+    put(S.closing,'headline',p.closing.headline); put(S.closing,'body',p.closing.body);
+    put(S.closing,'statement',p.closing.statement); put(S.closing,'statementMeta',p.closing.statementMeta);
+  }
+
+  /* gallery — planned tiles first, then any photograph nobody claimed */
+  const g = ok(p.gallery) ? p.gallery : {};
+  put(S.gallery,'intro',g.intro);
+  (Array.isArray(g.photos) ? g.photos : []).forEach(it=>{
+    if(!ok(it)) return;
+    const im = take(it.photo); if(!im) return;
+    S.gallery.items.push({ id:uid(), image: im, caption: String(it.caption||'').trim().toUpperCase() }); done.gallery++;
+  });
+  photos.forEach((ph,i)=>{
+    if(used.has(i)) return;
+    const im = take(i);
+    S.gallery.items.push({ id:uid(), image: im, caption: '' }); done.gallery++;
+  });
+  return done;
+}
+
+/* a dropped folder has to be walked entry by entry; plain files come as they are */
+async function droppedFiles(dt){
+  const items = Array.from(dt.items||[]);
+  const entries = items.map(it=> it.webkitGetAsEntry ? it.webkitGetAsEntry() : null);
+  if(!entries.some(Boolean)) return Array.from(dt.files||[]);
+  const out = [];
+  const readDir = dir => new Promise(res=>{
+    const reader = dir.createReader(); const all = [];
+    const step = ()=> reader.readEntries(batch=>{ if(!batch.length) return res(all); all.push(...batch); step(); }, ()=> res(all));
+    step();
+  });
+  const walk = async ent=>{
+    if(!ent) return;
+    if(ent.isFile){ const f = await new Promise(res=> ent.file(res, ()=> res(null))); if(f) out.push(f); }
+    else if(ent.isDirectory){ for(const child of await readDir(ent)) await walk(child); }
+  };
+  for(const ent of entries) await walk(ent);
+  return out;
+}
+
+/* ---- the dialog ------------------------------------------------------- */
+function openAutoFill(){
+  if($('.mask.ai')) return;
+  const picked = [];                 /* { file, url } */
+  let ctrl = null;
+  const m = document.createElement('div'); m.className = 'mask ai';
+  m.innerHTML =
+    '<div class="modal ai-modal">'+
+      '<h3>Fill the report from photographs</h3>'+
+      '<p>Choose every photograph from the event. Qwen looks at each one, seats it where it belongs — cover, sections, '+
+      'wide breaks, gallery, closing — writes its caption, and drafts any text you have left blank. '+
+      'The photographs stay inside this report; a small copy of each goes to Groq only while it is being read.</p>'+
+      '<div class="fgroup"><label>About the event</label>'+
+        '<textarea class="fld" id="aiNotes" rows="4" placeholder="What happened and in what order, who came, what was said, anything worth remembering…"></textarea>'+
+        '<div class="hint">The more you say here, the better the writing. The report details (event, date, department) go along automatically.</div></div>'+
+      '<div class="fgroup"><label>Photographs <span id="aiCount"></span></label>'+
+        '<div class="drop" id="aiDrop">'+svg(IC.photo)+'<div class="l1">Add photographs</div><div class="l2">Drop a whole folder here, or choose one below</div></div>'+
+        '<div class="ai-pick"><button class="mini" id="aiPickDir">'+svg(IC.stack)+'Choose a folder</button>'+
+        '<button class="mini" id="aiPickFiles">'+svg(IC.photo)+'Choose photographs</button></div>'+
+        '<div class="ai-strip" id="aiStrip"></div></div>'+
+      (GROQ.key ? '' :
+      '<div class="fgroup"><label>Groq API key</label>'+
+        '<input class="fld" id="aiKey" type="password" autocomplete="off" placeholder="gsk_…" value="'+esc(groqKey())+'">'+
+        '<div class="hint">Free at console.groq.com. Kept only in this browser, never inside the report file.</div></div>')+
+      '<label class="ai-check"><input type="checkbox" id="aiOverwrite"> Replace photos and text already in the report</label>'+
+      '<div class="ai-prog hidden" id="aiProg"><div class="bar"><i></i></div><div class="msg"></div></div>'+
+      '<div class="acts"><button class="tbtn" data-x="cancel">Cancel</button>'+
+      '<button class="tbtn primary" data-x="go" disabled>Start</button></div>'+
+    '</div>';
+  document.body.appendChild(m);
+  const goBtn = $('[data-x="go"]', m), drop = $('#aiDrop', m), strip = $('#aiStrip', m),
+        prog = $('#aiProg', m), bar = $('.bar i', prog), msg = $('.msg', prog);
+
+  const close = ()=>{ if(ctrl) ctrl.abort(); picked.forEach(p=> URL.revokeObjectURL(p.url)); m.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = e=>{ if(e.key==='Escape') close(); };
+  document.addEventListener('keydown', onKey);
+
+  const add = files=>{
+    files = files.filter(f=> f && /^image\//.test(f.type) && !/^\./.test(f.name));
+    /* a folder arrives in whatever order the browser likes — sort it the way a
+       camera names things, so the planner sees the day in sequence */
+    files.sort((a,b)=> a.name.localeCompare(b.name, undefined, { numeric:true, sensitivity:'base' }));
+    files.forEach(f=> picked.push({ file:f, url: URL.createObjectURL(f) }));
+    strip.innerHTML = picked.slice(0,40).map((p,i)=> '<span><img src="'+p.url+'"><button data-rm="'+i+'" title="Remove">'+svg(IC.x)+'</button></span>').join('')+
+      (picked.length > 40 ? '<span class="more">+'+(picked.length-40)+'</span>' : '');
+    $('#aiCount', m).textContent = picked.length ? '('+picked.length+')' : '';
+    goBtn.disabled = !picked.length || !keyOK();
+  };
+  const keyOK = ()=>{ const k = $('#aiKey', m); return GROQ.key || !!(k && k.value.trim()); };
+  if($('#aiKey', m)) $('#aiKey', m).addEventListener('input', ()=>{ goBtn.disabled = !picked.length || !keyOK(); });
+  drop.addEventListener('click', async ()=> add(await pickFiles($('#fileBulk'))));
+  $('#aiPickFiles', m).addEventListener('click', async ()=> add(await pickFiles($('#fileBulk'))));
+  $('#aiPickDir', m).addEventListener('click', async ()=> add(await pickFiles($('#fileBulkDir'))));
+  drop.addEventListener('dragover', e=>{ e.preventDefault(); drop.classList.add('over'); });
+  drop.addEventListener('dragleave', ()=> drop.classList.remove('over'));
+  drop.addEventListener('drop', async e=>{
+    e.preventDefault(); drop.classList.remove('over');
+    drop.querySelector('.l1').textContent = 'Reading…';
+    try{ add(await droppedFiles(e.dataTransfer)); }
+    finally{ drop.querySelector('.l1').textContent = 'Add photographs'; }
+  });
+  strip.addEventListener('click', e=>{
+    const b = e.target.closest('[data-rm]'); if(!b) return;
+    URL.revokeObjectURL(picked[Number(b.dataset.rm)].url); picked.splice(Number(b.dataset.rm),1); add([]);
+  });
+
+  const progress = (frac, text, isErr)=>{
+    prog.classList.remove('hidden');
+    bar.style.width = Math.round(Math.max(0, Math.min(1, frac))*100)+'%';
+    msg.textContent = text; msg.classList.toggle('err', !!isErr);
+  };
+
+  m.addEventListener('click', async e=>{
+    const b = e.target.closest('[data-x]');
+    if(!b){ return; }
+    if(b.dataset.x !== 'go'){ close(); return; }
+    if(!picked.length) return;
+    const notes = $('#aiNotes', m).value, overwrite = $('#aiOverwrite', m).checked;
+    if($('#aiKey', m)) rememberGroqKey($('#aiKey', m).value.trim());
+    ctrl = new AbortController();
+    goBtn.disabled = true; $('#aiOverwrite', m).disabled = true; $('#aiNotes', m).disabled = true; drop.classList.add('hidden');
+    const opts = { signal: ctrl.signal, onWait: null };
+    const n = picked.length;
+    try{
+      /* 1. bring the photographs in, exactly as a hand-added photo comes in */
+      const photos = [];
+      for(let i=0;i<n;i++){
+        progress(0.08*(i/n), 'Preparing photograph '+(i+1)+' of '+n+'…');
+        const image = await ingest(picked[i].file, { alpha:false });
+        photos.push({ image, small: await analysisCopy(image, 768) });
+        if(ctrl.signal.aborted) throw new Error('cancelled');
+      }
+      /* 2. one at a time — Groq's free tier meters tokens per minute and an
+            image costs ~1,800 of them, so a queue with polite waits beats a burst */
+      const ctx = eventContext(notes);
+      const descs = [];
+      for(let i=0;i<n;i++){
+        const base = 0.08 + 0.72*(i/n);
+        progress(base, 'Reading photograph '+(i+1)+' of '+n+' with '+ai.model+'…');
+        opts.onWait = s=> progress(base, 'Groq asked us to wait '+Math.ceil(s)+'s (rate limit) — photograph '+(i+1)+' of '+n+'…');
+        descs.push(await describePhoto(photos[i], ctx, opts));
+      }
+      /* 3. plan the whole report in one go */
+      progress(0.82, 'Planning where each photograph goes and writing the text…');
+      opts.onWait = s=> progress(0.82, 'Groq asked us to wait '+Math.ceil(s)+'s (rate limit) before planning…');
+      const plan = await planReport(descs, ctx, overwrite, opts);
+      /* 4. apply */
+      progress(0.96, 'Placing photographs…');
+      const done = applyPlan(plan, photos, descs, overwrite);
+      ui.folder = 'cover'; ui.sel = {};
+      renderAll(); touch(); goPane('side');
+      picked.forEach(p=> URL.revokeObjectURL(p.url)); picked.length = 0;
+      const parts = [];
+      if(done.cover) parts.push('cover photo');
+      if(done.sections) parts.push(done.sections+' section photo'+(done.sections===1?'':'s'));
+      if(done.features) parts.push(done.features+' wide photo'+(done.features===1?'':'s'));
+      if(done.gallery) parts.push(done.gallery+' in the gallery');
+      if(done.closing) parts.push('closing photo');
+      $('.modal', m).innerHTML =
+        '<h3>Done</h3>'+
+        '<p><b>'+n+' photograph'+(n===1?'':'s')+' placed</b>'+(parts.length? ' — '+parts.join(', ') : '')+'.'+
+        (done.newSections? ' '+done.newSections+' new section'+(done.newSections===1?'':'s')+' added.' : '')+
+        (done.fields? ' '+done.fields+' text field'+(done.fields===1?'':'s')+' written.' : '')+'</p>'+
+        '<p>Everything is editable — read through the sections and captions, and switch to Preview to see the pages.</p>'+
+        '<div class="acts"><button class="tbtn primary" data-x="done">Open the report</button></div>';
+      toast('Report filled from '+n+' photograph'+(n===1?'':'s'));
+    }catch(err){
+      if(String(err && err.message) === 'cancelled') return;
+      progress(1, (err && err.message) || 'Something went wrong', true);
+      goBtn.disabled = false; goBtn.textContent = 'Try again';
+      $('#aiOverwrite', m).disabled = false; $('#aiNotes', m).disabled = false; drop.classList.remove('hidden');
+    }
+  });
+}
+
 document.addEventListener('click', async e=>{
   const t = e.target;
   const hit = s => t.closest(s);
@@ -1728,6 +2205,7 @@ document.addEventListener('click', async e=>{
   if(t.id==='btnSave'){ saveFile(); return; }
   if(t.closest('#btnSave')){ saveFile(); return; }
   if(t.closest('#btnOpen')){ openFile(); return; }
+  if(t.closest('#btnAI')){ openAutoFill(); return; }
   if(t.closest('#btnPdf')) { exportPDF(); return; }
   if(t.closest('#zIn'))  { ui.zoomAuto=false; ui.zoom=Math.min(1.6, ui.zoom+0.1); applyZoom(); return; }
   if(t.closest('#zOut')) { ui.zoomAuto=false; ui.zoom=Math.max(0.25, ui.zoom-0.1); applyZoom(); return; }
